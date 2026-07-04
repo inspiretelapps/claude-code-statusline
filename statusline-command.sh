@@ -8,6 +8,14 @@ project_dir=$(echo "$input" | jq -r '.workspace.project_dir')
 repo_name=$(basename "$project_dir")
 model=$(echo "$input" | jq -r '.model.display_name')
 
+# Effort level (Claude Code v2.1+)
+effort=$(echo "$input" | jq -r '.effort.level // empty')
+if [ -n "$effort" ]; then
+  model_display="${model} \033[2m(${effort})\033[0m"
+else
+  model_display="$model"
+fi
+
 # Fetch API usage from Anthropic (cached)
 CACHE_FILE="/tmp/claude-usage-cache.json"
 CACHE_MAX_AGE=60
@@ -24,26 +32,41 @@ fetch_usage() {
   fi
 }
 
-# Check cache age
-if [ -f "$CACHE_FILE" ]; then
-  cache_age=$(($(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)))
-  if [ $cache_age -lt $CACHE_MAX_AGE ]; then
-    api_usage=$(cat "$CACHE_FILE")
+# Prefer rate limits passed directly by Claude Code (v2.1+); fall back to the OAuth API
+five_hour_pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty' 2>/dev/null | cut -d. -f1)
+seven_day_pct=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty' 2>/dev/null | cut -d. -f1)
+
+if [ -z "$five_hour_pct" ]; then
+  # Check cache age
+  if [ -f "$CACHE_FILE" ]; then
+    cache_age=$(($(date +%s) - $(stat -f %m "$CACHE_FILE" 2>/dev/null || echo 0)))
+    if [ $cache_age -lt $CACHE_MAX_AGE ]; then
+      api_usage=$(cat "$CACHE_FILE")
+    fi
   fi
+
+  # Fetch fresh if no cache
+  if [ -z "$api_usage" ]; then
+    api_usage=$(fetch_usage)
+    if [ -n "$api_usage" ] && echo "$api_usage" | jq -e '.five_hour' >/dev/null 2>&1; then
+      echo "$api_usage" > "$CACHE_FILE"
+    fi
+  fi
+
+  # Parse API usage
+  five_hour_pct=$(echo "$api_usage" | jq -r '.five_hour.utilization // 0' 2>/dev/null | cut -d. -f1)
+  seven_day_pct=$(echo "$api_usage" | jq -r '.seven_day.utilization // 0' 2>/dev/null | cut -d. -f1)
 fi
 
-# Fetch fresh if no cache
-if [ -z "$api_usage" ]; then
-  api_usage=$(fetch_usage)
-  if [ -n "$api_usage" ] && echo "$api_usage" | jq -e '.five_hour' >/dev/null 2>&1; then
-    echo "$api_usage" > "$CACHE_FILE"
-  fi
+# Model-specific limit (only shown when the API still reports one; newer accounts return null)
+opus_pct=$(echo "$api_usage" | jq -r '(.seven_day_opus.utilization // .seven_day_sonnet.utilization // empty)' 2>/dev/null | cut -d. -f1)
+if echo "$api_usage" | jq -e '.seven_day_opus.utilization' >/dev/null 2>&1; then
+  model_limit_label="Opus"
+elif echo "$api_usage" | jq -e '.seven_day_sonnet.utilization' >/dev/null 2>&1; then
+  model_limit_label="Sonnet"
+else
+  model_limit_label=""
 fi
-
-# Parse API usage
-five_hour_pct=$(echo "$api_usage" | jq -r '.five_hour.utilization // 0' 2>/dev/null | cut -d. -f1)
-seven_day_pct=$(echo "$api_usage" | jq -r '.seven_day.utilization // 0' 2>/dev/null | cut -d. -f1)
-opus_pct=$(echo "$api_usage" | jq -r '.seven_day_opus.utilization // 0' 2>/dev/null | cut -d. -f1)
 
 # Get git branch
 cd "$project_dir" 2>/dev/null
@@ -81,37 +104,44 @@ session_total=$((total_input + total_output))
 
 # Format with K/M suffix for readability
 if [ $session_total -ge 1000000 ]; then
-  session_display=$(awk "BEGIN {printf \"%.1fM\", $session_total/1000000}")
+  session_display=$(LC_NUMERIC=C awk "BEGIN {printf \"%.1fM\", $session_total/1000000}")
 elif [ $session_total -ge 1000 ]; then
-  session_display=$(awk "BEGIN {printf \"%.1fK\", $session_total/1000}")
+  session_display=$(LC_NUMERIC=C awk "BEGIN {printf \"%.1fK\", $session_total/1000}")
 else
   session_display="${session_total}"
 fi
 
-# Color code usage percentages (green < 60, yellow 60-89, red >= 90)
+# Show remaining percentage, color coded (green > 40 left, yellow 11-40, red <= 10)
 color_pct() {
-  local pct=$1
-  if [ "$pct" -ge 90 ]; then
-    echo "\033[31m${pct}%\033[0m"  # red
-  elif [ "$pct" -ge 60 ]; then
-    echo "\033[33m${pct}%\033[0m"  # yellow
+  local used=$1
+  local left=$((100 - ${used:-0}))
+  if [ "$left" -le 10 ] 2>/dev/null; then
+    echo "\033[31m${left}%\033[0m"  # red
+  elif [ "$left" -le 40 ] 2>/dev/null; then
+    echo "\033[33m${left}%\033[0m"  # yellow
   else
-    echo "\033[32m${pct}%\033[0m"  # green
+    echo "\033[32m${left}%\033[0m"  # green
   fi
 }
 
 five_hour_display=$(color_pct "$five_hour_pct")
 seven_day_display=$(color_pct "$seven_day_pct")
-opus_display=$(color_pct "$opus_pct")
+
+if [ -n "$model_limit_label" ]; then
+  opus_display=$(color_pct "$opus_pct")
+  model_limit_segment=" · ${model_limit_label} ${opus_display}"
+else
+  model_limit_segment=""
+fi
 
 # Output status line with clear labels
-# Format: repo | model | Context [bar] % | Tokens: N | Limits: 5hr% 7day% Opus% | (branch)
-printf "\033[33m%s\033[0m | %s | Context %b | Tokens: \033[36m%s\033[0m | Limits: 5hr %b · 7day %b · Opus %b | (\033[32m%s\033[0m)" \
+# Format: repo | model (effort) | Context [bar] % | Tokens: N | Left: 5hr% 7day% [Model%] | (branch)
+printf "\033[33m%s\033[0m | %b | Context %b | Tokens: \033[36m%s\033[0m | Left: 5hr %b · 7day %b%b | (\033[32m%s\033[0m)" \
   "$repo_name" \
-  "$model" \
+  "$model_display" \
   "$context_display" \
   "$session_display" \
   "$five_hour_display" \
   "$seven_day_display" \
-  "$opus_display" \
+  "$model_limit_segment" \
   "$branch"

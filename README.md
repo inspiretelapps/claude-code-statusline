@@ -9,10 +9,10 @@ A custom statusline script for Claude Code on macOS that displays useful session
 ## What It Displays
 
 - **Repository name** - Current project directory name
-- **Model** - Active Claude model (e.g., "Opus")
+- **Model** - Active Claude model and effort level (e.g., "Opus (medium)")
 - **Context window** - Visual progress bar with percentage
 - **Session tokens** - Total tokens used this session (formatted as K/M)
-- **API usage** - 5-hour and 7-day utilization (color-coded: green <60%, yellow 60-89%, red ≥90%)
+- **Usage remaining** - 5-hour and 7-day quota left (color-coded: green >40% left, yellow 11-40%, red ≤10%)
 - **Git branch** - Current branch name
 
 ## Requirements
@@ -59,8 +59,9 @@ chmod +x ~/.claude/statusline-command.sh
 
 The script receives JSON on stdin from Claude Code containing:
 - Workspace info (project directory)
-- Model info
+- Model info and effort level
 - Context window usage and size
 - Session token counts
+- Rate limit usage (Claude Code v2.1+)
 
-It also fetches API usage from Anthropic's OAuth endpoint using credentials stored in macOS Keychain, with a 60-second cache to avoid excessive API calls.
+On Claude Code v2.1+ the rate limits come straight from that stdin JSON, so no network call is needed. On older versions the script falls back to fetching usage from Anthropic's OAuth endpoint using credentials stored in macOS Keychain, with a 60-second cache to avoid excessive API calls.
